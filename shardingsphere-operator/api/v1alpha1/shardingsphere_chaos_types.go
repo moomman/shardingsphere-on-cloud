@@ -42,13 +42,19 @@ type ShardingSphereChaos struct {
 
 // ShardingSphereChaosSpec defines the desired state of ShardingSphereChaos
 type ShardingSphereChaosSpec struct {
-	InjectJob  JobSpec `json:"injectJob,omitempty"`
-	EmbedChaos `json:",inline"`
-	Expect     Expect `json:"expect,omitempty"`
+	InjectJob   JobSpec `json:"injectJob,omitempty"`
+	EmbedChaos  `json:",inline"`
+	PressureCfg PressureCfg `json:"pressureCfg"`
 }
 
-type Expect struct {
-	Verify string `json:"verify,omitempty"`
+type PressureCfg struct {
+	ZkHost        string          `json:"zkHost,omitempty"`
+	SsHost        string          `json:"ssHost"`
+	Duration      metav1.Duration `json:"duration"`
+	ReqTime       metav1.Duration `json:"reqTime"`
+	DistSqls      []string        `json:"distSqls,omitempty"`
+	ConcurrentNum int             `json:"concurrentNum"`
+	ReqNum        int             `json:"reqNum"`
 }
 
 type Script string

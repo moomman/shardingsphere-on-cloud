@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/apache/shardingsphere-on-cloud/shardingsphere-operator/pkg/pressure"
+
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/apache/shardingsphere-on-cloud/shardingsphere-operator/api/v1alpha1"
@@ -70,9 +72,10 @@ type ShardingSphereChaosReconciler struct {
 	Events    record.EventRecorder
 	ClientSet *clientset.Clientset
 
-	Chaos     sschaos.Chaos
-	Job       job.Job
-	ConfigMap configmap.ConfigMap
+	Chaos        sschaos.Chaos
+	Job          job.Job
+	ExecRecorder []*pressure.Pressure
+	ConfigMap    configmap.ConfigMap
 }
 
 // Reconcile handles main function of this controller
@@ -114,12 +117,21 @@ func (r *ShardingSphereChaosReconciler) Reconcile(ctx context.Context, req ctrl.
 		r.Events.Event(ssChaos, "Warning", "configmap error", err.Error())
 	}
 
-	if err := r.reconcileJob(ctx, ssChaos); err != nil {
+	/*
+		Todo
+		if err := r.reconcileJob(ctx, ssChaos); err != nil {
+			if err != nil {
+				errors = append(errors, err)
+			}
+			logger.Error(err, "reconcile job error")
+			r.Events.Event(ssChaos, "Warning", "job error", err.Error())
+		}
+	*/
+
+	if err := r.reconcilePressure(ctx, ssChaos); err != nil {
 		if err != nil {
 			errors = append(errors, err)
 		}
-		logger.Error(err, "reconcile job error")
-		r.Events.Event(ssChaos, "Warning", "job error", err.Error())
 	}
 
 	if err := r.reconcileStatus(ctx, ssChaos); err != nil {
@@ -132,6 +144,107 @@ func (r *ShardingSphereChaosReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{Requeue: true}, err
 	}
 	return ctrl.Result{RequeueAfter: defaultRequeueTime}, nil
+}
+
+func (r *ShardingSphereChaosReconciler) reconcilePressure(ctx context.Context, chao *v1alpha1.ShardingSphereChaos) error {
+	exec := r.getNeedExec(chao)
+	if exec == nil {
+		exec := &pressure.Pressure{
+			Name:   getExecName(chao),
+			Active: false,
+		}
+		go exec.Run(ctx, chao)
+		r.ExecRecorder = append(r.ExecRecorder, exec)
+	}
+
+	return nil
+}
+
+func (r *ShardingSphereChaosReconciler) reconcileStatus(ctx context.Context, chaos *v1alpha1.ShardingSphereChaos) error {
+	namespacedName := types.NamespacedName{
+		Name:      chaos.Name,
+		Namespace: chaos.Namespace,
+	}
+
+	setDefaultStatus(chaos)
+	r.updatePhaseExec(chaos)
+
+	if err := r.updateChaosCondition(ctx, chaos); err != nil {
+		return err
+	}
+
+	rt, err := r.getRuntimeChaos(ctx, namespacedName)
+	if err != nil {
+		return err
+	}
+	rt.Status = chaos.Status
+
+	return r.Status().Update(ctx, rt)
+}
+
+func (r *ShardingSphereChaosReconciler) updatePhaseExec(chaos *v1alpha1.ShardingSphereChaos) {
+	exec := r.getNeedExec(chaos)
+	if exec == nil || exec.Active {
+		return
+	}
+
+	//todo: judge error
+
+	msg := generateMsgFromExec(exec)
+	//when exec finished, update phase
+	switch chaos.Status.Phase {
+	case v1alpha1.BeforeSteady:
+		chaos.Status.Result.Steady = *msg
+		chaos.Status.Phase = v1alpha1.BeforeChaos
+	case v1alpha1.BeforeChaos:
+		chaos.Status.Result.Chaos = *msg
+		chaos.Status.Phase = v1alpha1.AfterChaos
+	}
+
+}
+
+func generateMsgFromExec(exec *pressure.Pressure) *v1alpha1.Msg {
+	//todo: wait to change result compute way
+	rate := 0
+	if exec.Result.Total == 0 {
+		rate = 0
+	} else {
+		rate = exec.Result.Success / exec.Result.Total
+	}
+	msg := v1alpha1.Msg{
+		Result:   fmt.Sprintf("%d", rate),
+		Duration: exec.Result.Duration.String(),
+	}
+	if exec.Err != nil {
+		msg.FailureDetails = exec.Err.Error()
+	}
+
+	return &msg
+}
+
+func getExecName(chao *v1alpha1.ShardingSphereChaos) string {
+	var execName string
+	if chao.Status.Phase == v1alpha1.BeforeSteady || chao.Status.Phase == v1alpha1.AfterSteady {
+		execName = reconcile.MakeJobName(chao.Name, reconcile.InSteady)
+	}
+	if chao.Status.Phase == v1alpha1.BeforeChaos || chao.Status.Phase == v1alpha1.AfterChaos {
+		execName = reconcile.MakeJobName(chao.Name, reconcile.InChaos)
+	}
+
+	return execName
+}
+
+func (r *ShardingSphereChaosReconciler) getNeedExec(chao *v1alpha1.ShardingSphereChaos) *pressure.Pressure {
+	jobName := getExecName(chao)
+
+	//if pressure dont exist,run it
+	for i := range r.ExecRecorder {
+		if r.ExecRecorder[i].Name == jobName {
+			return r.ExecRecorder[i]
+		}
+	}
+
+	return nil
 }
 
 func (r *ShardingSphereChaosReconciler) getRuntimeChaos(ctx context.Context, name types.NamespacedName) (*v1alpha1.ShardingSphereChaos, error) {
@@ -215,7 +328,7 @@ func (r *ShardingSphereChaosReconciler) deleteNetworkChaos(ctx context.Context, 
 func (r *ShardingSphereChaosReconciler) reconcileChaos(ctx context.Context, chaos *v1alpha1.ShardingSphereChaos) error {
 	logger := r.Log.WithValues("reconcile shardingspherechaos", fmt.Sprintf("%s/%s", chaos.Namespace, chaos.Name))
 
-	if chaos.Status.Phase == v1alpha1.BeforeSteady || chaos.Status.Phase == v1alpha1.AfterSteady {
+	if chaos.Status.Phase == "" || chaos.Status.Phase == v1alpha1.BeforeSteady || chaos.Status.Phase == v1alpha1.AfterSteady {
 		return nil
 	}
 
@@ -336,6 +449,7 @@ func (r *ShardingSphereChaosReconciler) reconcileConfigMap(ctx context.Context, 
 	return nil
 }
 
+// nolint:unused
 func (r *ShardingSphereChaosReconciler) reconcileJob(ctx context.Context, chaos *v1alpha1.ShardingSphereChaos) error {
 	var jobType reconcile.JobType
 
@@ -365,7 +479,8 @@ func (r *ShardingSphereChaosReconciler) reconcileJob(ctx context.Context, chaos 
 	return r.createJob(ctx, jobType, chaos)
 }
 
-func (r *ShardingSphereChaosReconciler) reconcileStatus(ctx context.Context, chaos *v1alpha1.ShardingSphereChaos) error {
+// nolint:unused
+func (r *ShardingSphereChaosReconciler) reconcileStatusWithJob(ctx context.Context, chaos *v1alpha1.ShardingSphereChaos) error {
 	namespacedName := types.NamespacedName{
 		Name:      chaos.Name,
 		Namespace: chaos.Namespace,
@@ -413,6 +528,7 @@ func (r *ShardingSphereChaosReconciler) reconcileStatus(ctx context.Context, cha
 	return r.Status().Update(ctx, rt)
 }
 
+// nolint:unused
 func updatePhase(chaos *v1alpha1.ShardingSphereChaos, job *batchV1.Job) {
 	switch {
 	//in this phase,update to next,and collect job msg
@@ -438,6 +554,7 @@ func setDefaultStatus(chaos *v1alpha1.ShardingSphereChaos) {
 // * AfterSteady: it has been finished, could start a new experiment
 // * InjectChaos: it has been started, could start some pressure
 // * recoveredChaos: it has been recovered, could start to verify
+// nolint:unused
 func getJobType(ssChaos *v1alpha1.ShardingSphereChaos) reconcile.JobType {
 	var jobType reconcile.JobType
 
@@ -452,6 +569,7 @@ func getJobType(ssChaos *v1alpha1.ShardingSphereChaos) reconcile.JobType {
 	return jobType
 }
 
+// nolint:unused
 func (r *ShardingSphereChaosReconciler) getJobByNamespacedName(ctx context.Context, namespacedName types.NamespacedName) (*batchV1.Job, error) {
 	job, err := r.Job.GetByNamespacedName(ctx, namespacedName)
 	if err != nil {
@@ -460,6 +578,7 @@ func (r *ShardingSphereChaosReconciler) getJobByNamespacedName(ctx context.Conte
 	return job, nil
 }
 
+// nolint:unused
 func getJobCondition(conditions []batchV1.JobCondition) JobCondition {
 	var ret = ActiveJob
 	for i := range conditions {
@@ -479,6 +598,7 @@ func getJobCondition(conditions []batchV1.JobCondition) JobCondition {
 	return ret
 }
 
+// nolint:unused
 func (r *ShardingSphereChaosReconciler) collectJobMsg(ctx context.Context, ssChaos *v1alpha1.ShardingSphereChaos, rJob *batchV1.Job) error {
 	if isExistResult(ssChaos) {
 		return nil
@@ -515,6 +635,7 @@ func (r *ShardingSphereChaosReconciler) collectJobMsg(ctx context.Context, ssCha
 	return nil
 }
 
+// nolint:unused
 func isExistResult(ssChaos *v1alpha1.ShardingSphereChaos) bool {
 	if ssChaos.Status.Phase == v1alpha1.AfterSteady && ssChaos.Status.Result.Steady.Result == "" {
 		return true
@@ -527,6 +648,7 @@ func isExistResult(ssChaos *v1alpha1.ShardingSphereChaos) bool {
 }
 
 // FIXME: this will broke if the log is too long
+// nolint:unused
 func (r *ShardingSphereChaosReconciler) getPodLog(ctx context.Context, rJob *batchV1.Job) ([]byte, error) {
 	pods := &corev1.PodList{}
 
@@ -618,6 +740,7 @@ func (r *ShardingSphereChaosReconciler) createConfigMap(ctx context.Context, cha
 }
 
 // TODO: consider a new job name pattern
+// nolint:unused
 func (r *ShardingSphereChaosReconciler) updateJob(ctx context.Context, requirement reconcile.JobType, chao *v1alpha1.ShardingSphereChaos, cur *batchV1.Job) error {
 	isEqual, err := reconcile.IsJobChanged(chao, requirement, cur)
 	if err != nil {
@@ -631,6 +754,7 @@ func (r *ShardingSphereChaosReconciler) updateJob(ctx context.Context, requireme
 	return nil
 }
 
+// nolint:unused
 func (r *ShardingSphereChaosReconciler) createJob(ctx context.Context, requirement reconcile.JobType, chao *v1alpha1.ShardingSphereChaos) error {
 	injectJob, err := reconcile.NewJob(chao, requirement)
 	if err != nil {
